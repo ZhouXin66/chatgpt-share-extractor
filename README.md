@@ -63,7 +63,7 @@ Invoke-WebRequest -Uri "https://chatgpt.com/share/<id>" -UseBasicParsing -Timeou
 
 ```text
 Use $skill-installer to install:
-https://github.com/<YOUR_GITHUB_USERNAME>/chatgpt-share-extractor/tree/main/skills/chatgpt-share-extractor
+https://github.com/ZhouXin66/chatgpt-share-extractor/tree/main/skills/chatgpt-share-extractor
 ```
 
 也可以将 `skills/chatgpt-share-extractor` 复制到 Codex 支持的个人或仓库 skill 目录。安装后可显式调用：
