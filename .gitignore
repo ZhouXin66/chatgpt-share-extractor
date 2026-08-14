@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Private or generated conversation artifacts
+private/
+tmp/
+share.html
+share-*.html
+conversation.md
+conversation-*.md
+output.md

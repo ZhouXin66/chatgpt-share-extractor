@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT Share Extractor"
+  short_description: "Extract public ChatGPT share conversations to Markdown"
+  default_prompt: "Use $chatgpt-share-extractor to extract this public ChatGPT share link into Markdown."
