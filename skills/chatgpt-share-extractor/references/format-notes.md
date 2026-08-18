@@ -46,6 +46,25 @@ Conversation data normally contains:
 
 Try the known path first, then search resolved objects for a `mapping` object plus `linear_conversation` or message-bearing mapping values. Do not select an enqueue payload only because it is first or largest.
 
+## Conversation order and visibility
+
+Use `linear_conversation` when it exists. Entries may be node identifiers or resolved node objects. When it is absent, reconstruct the selected branch from `current_node` or `current_node_id` by following each node's `parent` link and reversing the resulting path. If no current node is exposed, choose the deepest valid parent chain. Do not silently use `mapping.values()` as conversation order.
+
+By default export only visible `user` and `assistant` messages. Skip messages marked by `is_visually_hidden_from_conversation`, `is_hidden`, `hidden`, `hide_in_conversation`, or `is_context_message`. Include other roles only when the user explicitly requests them; hidden messages remain excluded.
+
+## Rich message parts and assets
+
+Treat `message.content.parts` as typed parts rather than concatenating arbitrary objects as JSON. Preserve string parts and public text fields such as `text`, `caption`, and `transcript`. Recognize image, audio, video, file, and attachment parts from their content type and fields such as:
+
+- `image_url`, `audio_url`, `download_url`, `asset_url`, `url`, or `src`.
+- `asset_pointer`, `file_pointer`, or `sandbox_path`.
+- `filename`, `file_name`, `mime_type`, `alt_text`, or `caption`.
+- Attachment collections under the message, content, or metadata objects.
+
+Deduplicate repeated references within a message. Rewrite successfully archived references to relative Markdown links. If only a `file-service://` or `sandbox:` pointer is exposed and no public HTTPS URL can be resolved, keep an explicit unavailable-asset placeholder and record it in `assets.json`; never invent a private API endpoint.
+
+Download only HTTPS assets from the built-in ChatGPT/OpenAI host allowlist or an explicitly user-approved additional host. Revalidate redirects, reject credentials and non-default ports, bound per-file and total bytes, sanitize filenames, avoid collisions, deduplicate identical bytes by SHA-256, and exclude original signed URLs from the manifest.
+
 ## Failure triage
 
 - **No enqueue payloads:** Check whether the input is an HTML error page, login redirect, consent page, bot challenge, or a newly redesigned share page.
