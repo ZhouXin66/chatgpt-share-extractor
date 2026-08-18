@@ -524,11 +524,24 @@ class AssetDownloadTests(unittest.TestCase):
             response = FakeAssetResponse(
                 b"a,b\n1,2\n", asset_url, "text/csv", "report.csv"
             )
-            with mock.patch.object(extractor, "_open_asset", return_value=response):
+            stdout = io.StringIO()
+            with mock.patch.object(
+                extractor, "_open_asset", return_value=response
+            ), contextlib.redirect_stdout(stdout):
                 code = extractor.main(
-                    [str(input_path), "-o", str(output_path), "--download-assets"]
+                    [
+                        str(input_path),
+                        "-o",
+                        str(output_path),
+                        "--download-assets",
+                        "--json-summary",
+                    ]
                 )
             self.assertEqual(code, 0)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["assets_downloaded"], 1)
+            self.assertEqual(report["assets_unavailable"], 0)
+            self.assertTrue(report["manifest"].endswith("assets.json"))
             self.assertIn(
                 "assets/report.csv", output_path.read_text(encoding="utf-8")
             )
@@ -556,6 +569,69 @@ class MarkdownAndCliTests(unittest.TestCase):
                 output_path.read_text(encoding="utf-8"),
                 "用户：\n你好\n\nChatGPT：\n你好！\n",
             )
+
+    def test_cli_quiet_suppresses_success_output(self):
+        html = enqueue_html(flatten(sample_root()))
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "share.html"
+            output_path = Path(directory) / "conversation.md"
+            input_path.write_text(html, encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = extractor.main(
+                    [str(input_path), "-o", str(output_path), "--quiet"]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertTrue(output_path.is_file())
+
+    def test_cli_json_summary_is_compact_and_content_free(self):
+        html = enqueue_html(flatten(sample_root()))
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "share.html"
+            output_path = Path(directory) / "conversation.md"
+            input_path.write_text(html, encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = extractor.main(
+                    [str(input_path), "-o", str(output_path), "--json-summary"]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue().count("\n"), 1)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(report["messages"], 2)
+            self.assertEqual(report["assets_downloaded"], 0)
+            self.assertEqual(report["assets_unavailable"], 0)
+            self.assertEqual(report["output"], str(output_path))
+            self.assertIsNone(report["manifest"])
+            self.assertNotIn("你好", stdout.getvalue())
+
+    def test_cli_json_summary_reports_safe_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "share.html"
+            output_path = Path(directory) / "conversation.md"
+            input_path.write_text("<html>not a share</html>", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = extractor.main(
+                    [str(input_path), "-o", str(output_path), "--json-summary"]
+                )
+            self.assertEqual(code, 2)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(report["stage"], "page recognition")
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertNotIn(str(input_path), stdout.getvalue())
+
+    def test_summary_modes_require_an_output_path(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = extractor.main(["unused.html", "--json-summary"])
+        self.assertEqual(code, 2)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["stage"], "output")
 
     def test_cli_diagnose_prints_safe_json_without_writing_markdown(self):
         html = enqueue_html(flatten(sample_root()))

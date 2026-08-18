@@ -11,7 +11,7 @@ Extract a public ChatGPT shared conversation with the bundled standard-library P
 
 1. Confirm that the input is either a public `https://chatgpt.com/share/...` URL or a local HTML file saved from such a page.
 2. Treat the share URL, downloaded HTML, and extracted Markdown as potentially sensitive. Do not echo the full URL or conversation into logs, issues, or unrelated files.
-3. Resolve this skill's directory from the loaded `SKILL.md`, then run `scripts/extract_chatgpt_share.py` with the requested input and output path. For file exports, pass `--download-assets` unless the user explicitly requests text only.
+3. Resolve this skill's directory from the loaded `SKILL.md`, then run `scripts/extract_chatgpt_share.py` with the requested input and output path. For file exports, pass `--download-assets` unless the user explicitly requests text only, and pass `--json-summary` for a compact machine-readable result.
 4. If direct URL fetching fails because the execution environment has no permitted network path, use an available sanctioned browser or web-fetch capability to save the public page as HTML. On Windows, `Invoke-WebRequest` is an optional fallback, not a requirement.
 5. Run the extractor on the saved HTML and verify the reported visible-message and asset counts, output file, relative asset links, and `assets/assets.json` when assets were referenced.
 6. If parsing fails, run the same input with `--diagnose`, inspect only its structural counts and failure stage, then read [references/format-notes.md](references/format-notes.md) before changing the parser.
@@ -21,16 +21,18 @@ Extract a public ChatGPT shared conversation with the bundled standard-library P
 Use Python 3 and quote paths:
 
 ```bash
-python "<skill-directory>/scripts/extract_chatgpt_share.py" "https://chatgpt.com/share/<id>" -o conversation.md --download-assets
+python "<skill-directory>/scripts/extract_chatgpt_share.py" "https://chatgpt.com/share/<id>" -o conversation.md --download-assets --json-summary
 ```
 
 For a previously saved page:
 
 ```bash
-python "<skill-directory>/scripts/extract_chatgpt_share.py" share.html -o conversation.md --download-assets
+python "<skill-directory>/scripts/extract_chatgpt_share.py" share.html -o conversation.md --download-assets --json-summary
 ```
 
 Use `--no-roles` to omit role labels or `--bold-roles` to bold them. Use `--assets-dir <path>` to override the default `assets/` folder beside the Markdown. Use `--strict-assets` only when the whole export must fail if any referenced asset is unavailable. Use `--asset-host <domain>` only with user intent when a legitimate public asset is hosted outside the built-in ChatGPT/OpenAI asset domains. Without `-o`, the script writes Markdown to stdout; avoid stdout when the conversation may be sensitive or terminal output is recorded.
+
+Use `--json-summary` with `-o` for a single-line success or failure report that omits the source URL and conversation content. Use `--quiet` instead when no success output is needed; errors still go to standard error. Do not combine these mutually exclusive modes with `--diagnose`.
 
 For safe structural diagnostics without exporting content:
 

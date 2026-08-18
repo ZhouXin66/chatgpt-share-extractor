@@ -1407,6 +1407,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input", help="https://chatgpt.com/share/... 链接或已保存的 HTML 文件")
     parser.add_argument("-o", "--output", help="输出 .md 路径；默认打印到标准输出")
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
+        "--json-summary",
+        action="store_true",
+        help="以单行 JSON 输出成功或失败摘要；需要同时指定 -o",
+    )
+    summary_group.add_argument(
+        "--quiet",
+        action="store_true",
+        help="不输出成功提示；错误仍写入标准错误；需要同时指定 -o",
+    )
     parser.add_argument("--no-roles", action="store_true", help="不输出说话人标记")
     parser.add_argument("--bold-roles", action="store_true", help="加粗说话人标记")
     parser.add_argument(
@@ -1454,20 +1465,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_json_summary(payload) -> None:
+    sys.stdout.write(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     source = args.input
 
     try:
+        if (args.json_summary or args.quiet) and not args.output:
+            raise ExtractionError(
+                "output", "--json-summary and --quiet require an output Markdown path"
+            )
+        if args.diagnose and (
+            args.output or args.download_assets or args.json_summary or args.quiet
+        ):
+            raise ExtractionError(
+                "output",
+                "--diagnose cannot be combined with output, asset download, or summary modes",
+            )
         if "://" in source:
             html = fetch_html(source)
         else:
             html = read_html_file(source)
         if args.diagnose:
-            if args.output or args.download_assets:
-                raise ExtractionError(
-                    "output", "--diagnose cannot be combined with output or asset download"
-                )
             report = diagnose_html(
                 html, include_non_chat_roles=args.include_non_chat_roles
             )
@@ -1508,20 +1538,41 @@ def main(argv=None) -> int:
                 output_path.write_text(markdown, encoding="utf-8")
             except OSError as exc:
                 raise ExtractionError("output", "could not write the Markdown file") from exc
-            summary = f"已写入 {args.output}（共 {len(rich_messages)} 条消息"
-            if args.download_assets:
-                summary += f"，归档 {downloaded} 个附件，{asset_failures} 个不可用"
-            summary += "）"
-            print(summary)
-            if manifest_path is not None:
-                print(f"附件清单：{manifest_path}")
+            if args.json_summary:
+                _write_json_summary(
+                    {
+                        "assets_downloaded": downloaded,
+                        "assets_unavailable": asset_failures,
+                        "manifest": str(manifest_path) if manifest_path else None,
+                        "messages": len(rich_messages),
+                        "output": str(output_path),
+                        "status": "ok",
+                    }
+                )
+            elif not args.quiet:
+                summary = f"已写入 {args.output}（共 {len(rich_messages)} 条消息"
+                if args.download_assets:
+                    summary += f"，归档 {downloaded} 个附件，{asset_failures} 个不可用"
+                summary += "）"
+                print(summary)
+                if manifest_path is not None:
+                    print(f"附件清单：{manifest_path}")
         else:
             sys.stdout.write(markdown)
         return 0
     except ExtractionError as exc:
-        print(f"失败：{exc}", file=sys.stderr)
-        if exc.stage == "fetch":
-            print(POWERSHELL_HINT, file=sys.stderr)
+        if args.json_summary:
+            _write_json_summary(
+                {
+                    "error": exc.message,
+                    "stage": exc.stage,
+                    "status": "error",
+                }
+            )
+        else:
+            print(f"失败：{exc}", file=sys.stderr)
+            if exc.stage == "fetch":
+                print(POWERSHELL_HINT, file=sys.stderr)
         return 2
 
 

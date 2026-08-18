@@ -47,6 +47,8 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 | 参数 | 作用 |
 |---|---|
 | `-o`, `--output` | 输出 Markdown 文件；省略时打印到标准输出 |
+| `--json-summary` | 配合 `-o` 输出单行、机器可读的成功或失败摘要 |
+| `--quiet` | 配合 `-o` 关闭成功提示；错误仍输出到标准错误 |
 | `--no-roles` | 不输出角色标签 |
 | `--bold-roles` | 将角色标签加粗 |
 | `--diagnose` | 只输出不含 URL、载荷和正文的结构诊断 JSON |
@@ -59,6 +61,8 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 | `--include-non-chat-roles` | 同时导出非用户/助手角色，隐藏消息仍会跳过 |
 
 附件下载默认采用尽力而为策略。无法公开下载的附件会在 Markdown 和 `assets.json` 中标记，但不会阻止其余对话导出。工具不会为 `file-service://` 指针猜测私有接口，也不会请求 Cookie 或令牌。
+
+自动化调用可增加 `--json-summary`，让工具只输出一行包含状态、消息数、附件数和输出路径的 JSON；其中不包含分享 URL、消息正文或附件 URL。如果调用方不需要成功信息，可改用 `--quiet`。这两个模式互斥，并且都要求指定 `-o`。
 
 解析失败时可运行安全诊断：
 
