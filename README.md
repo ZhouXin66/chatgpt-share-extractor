@@ -49,6 +49,7 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 | `-o`, `--output` | 输出 Markdown 文件；省略时打印到标准输出 |
 | `--no-roles` | 不输出角色标签 |
 | `--bold-roles` | 将角色标签加粗 |
+| `--diagnose` | 只输出不含 URL、载荷和正文的结构诊断 JSON |
 | `--download-assets` | 归档页面公开引用的图片、音频和文件 |
 | `--assets-dir` | 指定附件目录；默认使用 Markdown 同级的 `assets/` |
 | `--asset-host` | 显式增加一个允许下载的 HTTPS 资源域名，可重复指定 |
@@ -58,6 +59,16 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 | `--include-non-chat-roles` | 同时导出非用户/助手角色，隐藏消息仍会跳过 |
 
 附件下载默认采用尽力而为策略。无法公开下载的附件会在 Markdown 和 `assets.json` 中标记，但不会阻止其余对话导出。工具不会为 `file-service://` 指针猜测私有接口，也不会请求 Cookie 或令牌。
+
+解析失败时可运行安全诊断：
+
+```bash
+python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
+  share.html \
+  --diagnose
+```
+
+诊断只报告载荷数量、控制帧类型、引用数量、Promise 状态、候选对话和失败阶段，不输出分享 URL、消息正文、文件名或资源 URL。
 
 如果当前沙盒不允许 Python 访问网络，可以用环境允许的浏览器或网页工具先保存 HTML。Windows 下也可选择：
 
@@ -106,7 +117,7 @@ python -m unittest discover -s tests -v
 
 ## 页面格式与故障排查
 
-ChatGPT 分享页曾将对话数据放入 `enqueue("...")` 脚本载荷，并使用 React Router 的扁平引用数组。解析器优先检查已知路径，然后按 `mapping`、`linear_conversation` 和消息节点等语义字段查找对话。
+ChatGPT 分享页曾将对话数据放入 `enqueue("...")` 脚本载荷，并使用 React Router 的扁平引用图和 `P633:[{}]` 一类 Promise 控制帧。解析器先解除控制帧和合法容器回指，再按 `mapping`、`linear_conversation` 和消息节点等语义字段查找对话。
 
 错误信息会标注阶段：
 
@@ -114,7 +125,10 @@ ChatGPT 分享页曾将对话数据放入 `enqueue("...")` 脚本载荷，并使
 - `fetch`
 - `file input`
 - `page recognition`
-- `payload decoding`
+- `JavaScript decoding`
+- `JSON decoding`
+- `control frame decoding`
+- `reference resolution`
 - `conversation discovery`
 - `message extraction`
 - `asset download`

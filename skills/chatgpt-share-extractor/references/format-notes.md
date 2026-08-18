@@ -6,10 +6,11 @@ Read this reference only when extraction fails or the share-page format appears 
 
 1. Fetch or read the HTML without authenticated account data.
 2. Locate double-quoted `enqueue("...")` JavaScript string payloads.
-3. Decode the JavaScript string and then its JSON value.
-4. Resolve the React Router flattened reference array.
-5. Locate conversation data by semantic fields.
-6. Extract visible non-empty messages in conversation order.
+3. Decode each JavaScript string.
+4. Classify the decoded text as a JSON root or a typed stream control frame.
+5. Resolve Promise control frames and the React Router flattened reference graph.
+6. Locate conversation data by semantic fields.
+7. Extract visible non-empty messages in conversation order.
 
 Keep failures assigned to these stages. Do not collapse every structural error into "the page changed," because login pages, bot challenges, truncated files, and revoked shares can look similar.
 
@@ -23,7 +24,19 @@ The observed format is a JSON array whose item at index `0` is the root referenc
 - A two-item list shaped like `["P", index]` acts as a promise placeholder and resolves through `index`.
 - Other strings, booleans, floating-point values, and null values are literals.
 
-Reject out-of-range references, invalid object-key references, and cycles. These usually indicate a changed format, the wrong payload, or truncated input.
+Create dictionary and ordinary-list containers in the resolver cache before visiting their children. This preserves legitimate parent/child back-references and self-referential containers. Reject out-of-range references, invalid object-key references, and unresolvable Promise-alias cycles; do not reject a graph merely because it contains a container cycle.
+
+## Stream control frames
+
+An enqueue value such as `P633:[{}]` is a Promise resolution frame, not malformed JSON. Parse it as:
+
+- Frame kind: `P`.
+- Promise target: `633`.
+- JSON body: `[{}]`.
+
+Resolve the frame body as its own flattened value and make the result available when the root graph encounters `["P", 633]`. A self-referential Promise marker without a matching frame is an unresolved deferred value and may resolve to `None` when it is not required for the visible conversation. Reject mutually recursive Promise aliases that have no concrete frame value.
+
+Recognize structurally valid non-`P` control frames and count them in diagnostics, but do not invent semantics for unknown frame kinds.
 
 ## Conversation discovery
 
@@ -68,8 +81,13 @@ Download only HTTPS assets from the built-in ChatGPT/OpenAI host allowlist or an
 ## Failure triage
 
 - **No enqueue payloads:** Check whether the input is an HTML error page, login redirect, consent page, bot challenge, or a newly redesigned share page.
-- **No decodable payloads:** Inspect payload counts and lengths, not their contents. Check whether quoting or chunking changed.
+- **JavaScript decoding:** The `enqueue` string literal itself could not be safely unescaped.
+- **JSON decoding:** Decoded text was neither JSON nor a structurally valid control frame, or no JSON root was present.
+- **Control frame decoding:** A typed frame was recognized but its JSON body was invalid.
+- **Reference resolution:** JSON roots were found but their flattened references, object keys, or Promise aliases were invalid.
 - **Decoded but no conversation:** Inspect key names and nesting. Prefer adding a semantic fallback over replacing the known fast path.
 - **Conversation but no messages:** Check whether `linear_conversation` changed from nodes to IDs, content moved away from `parts`, or every message is hidden/empty.
+
+Use `--diagnose` to print only structural counts such as enqueue values, frame kinds, array sizes, references, Promise markers, candidate conversations, visible-message count, and failure stage. Diagnostic output must never include the input URL, raw payload, message text, filenames, or asset URLs.
 
 Never place raw HTML, full payloads, share IDs, or extracted text into public issues or fixtures. Build the smallest synthetic fixture that reproduces a parser problem.

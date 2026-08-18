@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import io
 import json
@@ -53,6 +54,11 @@ def flatten(root):
 def enqueue_html(data):
     serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     encoded_string = json.dumps(serialized, ensure_ascii=False)
+    return f"<script>window.__reactRouterContext.streamController.enqueue({encoded_string})</script>"
+
+
+def enqueue_text(text):
+    encoded_string = json.dumps(text, ensure_ascii=False)
     return f"<script>window.__reactRouterContext.streamController.enqueue({encoded_string})</script>"
 
 
@@ -153,9 +159,36 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(extractor.ExtractionError, "outside the payload"):
             extractor.resolve([[5]])
 
-    def test_resolve_rejects_cycle(self):
-        with self.assertRaisesRegex(extractor.ExtractionError, "cyclic"):
-            extractor.resolve([[0]])
+    def test_resolve_preserves_container_back_reference(self):
+        data = [{"_1": 2}, "child", {"_3": 0}, "parent"]
+        stats = {}
+        root = extractor.resolve(data, stats=stats)
+        self.assertIs(root["child"]["parent"], root)
+        self.assertEqual(stats["container_back_references"], 1)
+
+    def test_resolve_keeps_unresolved_self_promise_safe(self):
+        stats = {}
+        self.assertIsNone(extractor.resolve([["P", 0]], stats=stats))
+        self.assertEqual(stats["unresolved_promises"], 1)
+
+    def test_resolve_rejects_unresolvable_promise_alias_cycle(self):
+        with self.assertRaisesRegex(extractor.ExtractionError, "unresolvable cycle"):
+            extractor.resolve([["P", 1], ["P", 0]])
+
+    def test_applies_promise_control_frame_before_resolving_root(self):
+        data = flatten(sample_root())
+        key_index = len(data)
+        data.append("deferred")
+        marker_index = len(data)
+        data.append(["P", marker_index])
+        data[0][f"_{key_index}"] = marker_index
+        html = enqueue_html(data) + enqueue_text(f"P{marker_index}:[{{}}]\n")
+        messages = extractor.extract_messages(html)
+        self.assertEqual(messages, [("user", "你好"), ("assistant", "你好！")])
+        _, report = extractor._resolved_payload_stream(html)
+        self.assertEqual(report["promise_frames"], 1)
+        self.assertEqual(report["resolved_promises"], 1)
+        self.assertEqual(report["unresolved_promises"], 0)
 
     def test_uses_semantic_payload_instead_of_first_payload(self):
         irrelevant = enqueue_html(["not a conversation"])
@@ -166,6 +199,35 @@ class PayloadTests(unittest.TestCase):
     def test_missing_enqueue_is_page_recognition_error(self):
         with self.assertRaisesRegex(extractor.ExtractionError, "page recognition"):
             extractor.extract_messages("<html><title>Login</title></html>")
+
+    def test_reports_json_decoding_separately(self):
+        with self.assertRaises(extractor.ExtractionError) as raised:
+            extractor.extract_messages(enqueue_text("not-json"))
+        self.assertEqual(raised.exception.stage, "JSON decoding")
+
+    def test_reports_javascript_decoding_separately(self):
+        html = r'<script>window.__reactRouterContext.streamController.enqueue("\x")</script>'
+        with self.assertRaises(extractor.ExtractionError) as raised:
+            extractor.extract_messages(html)
+        self.assertEqual(raised.exception.stage, "JavaScript decoding")
+
+    def test_counts_malformed_control_frame_body(self):
+        report = extractor.diagnose_html(enqueue_text("P7:not-json"))
+        self.assertEqual(report["control_frame_decoding_failures"], 1)
+        self.assertEqual(report["failure_stage"], "control frame decoding")
+
+    def test_reports_reference_resolution_separately(self):
+        with self.assertRaises(extractor.ExtractionError) as raised:
+            extractor.extract_messages(enqueue_html([[5]]))
+        self.assertEqual(raised.exception.stage, "reference resolution")
+
+    def test_diagnostics_expose_only_structural_counts(self):
+        report = extractor.diagnose_html(enqueue_html(flatten(sample_root())))
+        serialized = json.dumps(report, ensure_ascii=False)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["visible_messages"], 2)
+        self.assertNotIn("你好", serialized)
+        self.assertNotIn("chatgpt.com/share", serialized)
 
 
 class RichMessageTests(unittest.TestCase):
@@ -494,6 +556,20 @@ class MarkdownAndCliTests(unittest.TestCase):
                 output_path.read_text(encoding="utf-8"),
                 "用户：\n你好\n\nChatGPT：\n你好！\n",
             )
+
+    def test_cli_diagnose_prints_safe_json_without_writing_markdown(self):
+        html = enqueue_html(flatten(sample_root()))
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "share.html"
+            input_path.write_text(html, encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = extractor.main([str(input_path), "--diagnose"])
+            self.assertEqual(code, 0)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(report["visible_messages"], 2)
+            self.assertNotIn("你好", stdout.getvalue())
 
 
 if __name__ == "__main__":

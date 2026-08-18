@@ -35,6 +35,7 @@ ENQUEUE_RE = re.compile(
     r'(?:window\.__reactRouterContext\.streamController\.)?'
     r'enqueue\(\s*"((?:[^"\\]|\\.)*)"\s*\)'
 )
+CONTROL_FRAME_RE = re.compile(r"^([A-Z])(\d+):(.*)\s*$", re.DOTALL)
 MARKDOWN_LINK_RE = re.compile(
     r'(!?)\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+"[^"]*")?\s*\)'
 )
@@ -114,6 +115,15 @@ class RichMessage:
     @property
     def assets(self) -> list[AssetReference]:
         return [part for part in self.parts if isinstance(part, AssetReference)]
+
+
+@dataclass
+class ControlFrame:
+    """A structurally decoded React Router stream control frame."""
+
+    kind: str
+    target: int
+    value: object
 
 
 def _validate_remote_target(url: str) -> None:
@@ -203,26 +213,77 @@ def extract_enqueue_payloads(html: str) -> list[str]:
     return ENQUEUE_RE.findall(html)
 
 
-def decode_payload(raw: str):
-    """Decode the JavaScript string literal and its JSON payload."""
+def decode_javascript_string(raw: str) -> str:
+    """Decode one double-quoted JavaScript string without exposing its content."""
     try:
-        unescaped = json.loads('"' + raw + '"')
-        return json.loads(unescaped)
+        decoded = json.loads('"' + raw + '"')
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ExtractionError("payload decoding", "invalid serialized JSON") from exc
+        raise ExtractionError(
+            "JavaScript decoding", "invalid enqueue string escaping"
+        ) from exc
+    if not isinstance(decoded, str):
+        raise ExtractionError(
+            "JavaScript decoding", "the enqueue argument did not decode to text"
+        )
+    return decoded
+
+
+def decode_serialized_enqueue(serialized: str):
+    """Decode a JSON root or a typed React Router stream control frame."""
+    try:
+        return "json", json.loads(serialized)
+    except json.JSONDecodeError as json_error:
+        match = CONTROL_FRAME_RE.fullmatch(serialized)
+        if not match:
+            raise ExtractionError(
+                "JSON decoding", "enqueue text is neither JSON nor a control frame"
+            ) from json_error
+        kind, target_text, body = match.groups()
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ExtractionError(
+                "control frame decoding", "control frame body is not valid JSON"
+            ) from exc
+        return "control", ControlFrame(kind, int(target_text), value)
+
+
+def decode_enqueue_payload(raw: str):
+    return decode_serialized_enqueue(decode_javascript_string(raw))
+
+
+def decode_payload(raw: str):
+    """Decode a legacy JSON enqueue payload while rejecting control frames."""
+    kind, value = decode_enqueue_payload(raw)
+    if kind != "json":
+        raise ExtractionError("JSON decoding", "enqueue payload is a control frame")
+    return value
 
 
 def _is_reference(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def resolve(data):
-    """Resolve the flattened React Router reference serialization."""
+def resolve(data, promise_values=None, stats=None):
+    """Resolve a flattened reference graph, preserving legitimate back-references."""
     if not isinstance(data, list) or not data:
-        raise ExtractionError("payload decoding", "the serialized root is not a non-empty array")
+        raise ExtractionError(
+            "reference resolution", "the serialized root is not a non-empty array"
+        )
 
+    promise_values = promise_values or {}
+    stats = stats if stats is not None else {}
+    for key in (
+        "resolved_references",
+        "container_back_references",
+        "promise_markers",
+        "resolved_promises",
+        "unresolved_promises",
+    ):
+        stats.setdefault(key, 0)
     cache = {}
-    visiting = set()
+    active_containers = set()
+    active_aliases = set()
 
     def walk(reference):
         if _is_reference(reference) and reference < 0:
@@ -231,47 +292,215 @@ def resolve(data):
             return reference
         if reference < 0 or reference >= len(data):
             raise ExtractionError(
-                "payload decoding", f"reference index {reference} is outside the payload"
+                "reference resolution",
+                f"reference index {reference} is outside the payload",
             )
         if reference in cache:
+            if reference in active_containers:
+                stats["container_back_references"] += 1
             return cache[reference]
-        if reference in visiting:
-            raise ExtractionError("payload decoding", "cyclic reference detected")
+        if reference in active_aliases:
+            raise ExtractionError(
+                "reference resolution", "promise aliases contain an unresolvable cycle"
+            )
 
-        visiting.add(reference)
-        try:
-            value = data[reference]
-            if isinstance(value, dict):
-                output = {}
+        stats["resolved_references"] += 1
+        value = data[reference]
+        if isinstance(value, dict):
+            output = {}
+            cache[reference] = output
+            active_containers.add(reference)
+            try:
                 for encoded_key, child in value.items():
                     match = re.fullmatch(r"_(\d+)", encoded_key)
                     if not match:
                         raise ExtractionError(
-                            "payload decoding", "encountered an invalid object-key reference"
+                            "reference resolution",
+                            "encountered an invalid object-key reference",
                         )
                     key_index = int(match.group(1))
                     if key_index >= len(data) or not isinstance(data[key_index], str):
                         raise ExtractionError(
-                            "payload decoding", "object-key reference does not point to a string"
+                            "reference resolution",
+                            "object-key reference does not point to a string",
                         )
                     output[data[key_index]] = walk(child)
-            elif isinstance(value, list):
-                if (
-                    len(value) == 2
-                    and value[0] == "P"
-                    and _is_reference(value[1])
-                ):
-                    output = walk(value[1])
-                else:
-                    output = [walk(item) if _is_reference(item) else item for item in value]
-            else:
-                output = value
-            cache[reference] = output
+            except Exception:
+                cache.pop(reference, None)
+                raise
+            finally:
+                active_containers.discard(reference)
             return output
-        finally:
-            visiting.discard(reference)
+
+        if isinstance(value, list):
+            if len(value) == 2 and value[0] == "P" and _is_reference(value[1]):
+                stats["promise_markers"] += 1
+                target = value[1]
+                if target in promise_values:
+                    output = promise_values[target]
+                    stats["resolved_promises"] += 1
+                elif target == reference:
+                    output = None
+                    stats["unresolved_promises"] += 1
+                else:
+                    active_aliases.add(reference)
+                    try:
+                        output = walk(target)
+                    finally:
+                        active_aliases.discard(reference)
+                cache[reference] = output
+                return output
+
+            output = []
+            cache[reference] = output
+            active_containers.add(reference)
+            try:
+                output.extend(
+                    walk(item) if _is_reference(item) else item for item in value
+                )
+            except Exception:
+                cache.pop(reference, None)
+                raise
+            finally:
+                active_containers.discard(reference)
+            return output
+
+        cache[reference] = value
+        return value
 
     return walk(0)
+
+
+def _empty_stream_report(payload_count):
+    return {
+        "enqueue_payloads": payload_count,
+        "javascript_strings_decoded": 0,
+        "javascript_decoding_failures": 0,
+        "json_values": 0,
+        "json_decoding_failures": 0,
+        "control_frames": 0,
+        "control_frame_kinds": {},
+        "control_frame_decoding_failures": 0,
+        "promise_frames": 0,
+        "promise_frames_resolved": 0,
+        "promise_frame_resolution_failures": 0,
+        "root_candidates": 0,
+        "root_array_sizes": [],
+        "resolved_roots": 0,
+        "reference_resolution_failures": 0,
+        "resolved_references": 0,
+        "container_back_references": 0,
+        "promise_markers": 0,
+        "resolved_promises": 0,
+        "unresolved_promises": 0,
+    }
+
+
+def _resolved_payload_stream(html: str):
+    payloads = extract_enqueue_payloads(html)
+    report = _empty_stream_report(len(payloads))
+    json_values = []
+    control_frames = []
+
+    for raw in payloads:
+        try:
+            serialized = decode_javascript_string(raw)
+            report["javascript_strings_decoded"] += 1
+        except ExtractionError:
+            report["javascript_decoding_failures"] += 1
+            continue
+        try:
+            kind, value = decode_serialized_enqueue(serialized)
+        except ExtractionError as exc:
+            if exc.stage == "control frame decoding":
+                report["control_frame_decoding_failures"] += 1
+            else:
+                report["json_decoding_failures"] += 1
+            continue
+        if kind == "control":
+            control_frames.append(value)
+            report["control_frames"] += 1
+            kinds = report["control_frame_kinds"]
+            kinds[value.kind] = kinds.get(value.kind, 0) + 1
+        else:
+            json_values.append(value)
+            report["json_values"] += 1
+
+    promise_values = {}
+    for frame in control_frames:
+        if frame.kind != "P":
+            continue
+        report["promise_frames"] += 1
+        try:
+            value = (
+                resolve(frame.value, promise_values=promise_values)
+                if isinstance(frame.value, list)
+                else frame.value
+            )
+            promise_values[frame.target] = value
+            report["promise_frames_resolved"] += 1
+        except ExtractionError:
+            report["promise_frame_resolution_failures"] += 1
+
+    roots = []
+    for value in json_values:
+        if not isinstance(value, list) or not value:
+            continue
+        report["root_candidates"] += 1
+        report["root_array_sizes"].append(len(value))
+        resolve_stats = {}
+        try:
+            root = resolve(
+                value, promise_values=promise_values, stats=resolve_stats
+            )
+        except ExtractionError:
+            report["reference_resolution_failures"] += 1
+            continue
+        roots.append(root)
+        report["resolved_roots"] += 1
+        for key in (
+            "resolved_references",
+            "container_back_references",
+            "promise_markers",
+            "resolved_promises",
+            "unresolved_promises",
+        ):
+            report[key] += resolve_stats.get(key, 0)
+    return roots, report
+
+
+def _raise_payload_stream_failure(report):
+    if report["enqueue_payloads"] == 0:
+        raise ExtractionError(
+            "page recognition",
+            "no React Router enqueue payloads were found; the input may be an error, login, or changed share page",
+        )
+    if report["javascript_strings_decoded"] == 0:
+        raise ExtractionError(
+            "JavaScript decoding",
+            f"none of {report['enqueue_payloads']} enqueue string(s) could be decoded",
+        )
+    if report["json_values"] == 0:
+        if (
+            report["control_frame_decoding_failures"]
+            and report["json_decoding_failures"] == 0
+        ):
+            raise ExtractionError(
+                "control frame decoding",
+                "typed stream frames were found but their JSON bodies were invalid",
+            )
+        raise ExtractionError(
+            "JSON decoding",
+            "no serialized JSON root was found among the decoded enqueue values",
+        )
+    if report["root_candidates"] == 0:
+        raise ExtractionError(
+            "reference resolution", "no non-empty flattened root array was found"
+        )
+    raise ExtractionError(
+        "reference resolution",
+        f"none of {report['root_candidates']} flattened root candidate(s) could be resolved",
+    )
 
 
 def _known_conversation_data(root):
@@ -703,44 +932,83 @@ def extract_rich_messages_from_data(
 
 
 def _extract_rich_messages(html: str, include_non_chat_roles=False):
-    payloads = extract_enqueue_payloads(html)
-    if not payloads:
-        raise ExtractionError(
-            "page recognition",
-            "no React Router enqueue payloads were found; the input may be an error, login, or changed share page",
-        )
-
-    decoded_count = 0
+    roots, report = _resolved_payload_stream(html)
+    if not roots:
+        _raise_payload_stream_failure(report)
     conversation_count = 0
-    for raw in payloads:
-        try:
-            root = resolve(decode_payload(raw))
-        except ExtractionError:
-            continue
-        decoded_count += 1
+    last_message_error = None
+    for root in roots:
         conversation_data = find_conversation_data(root)
         if conversation_data is None:
             continue
         conversation_count += 1
-        messages = extract_rich_messages_from_data(
-            conversation_data, include_non_chat_roles=include_non_chat_roles
-        )
+        try:
+            messages = extract_rich_messages_from_data(
+                conversation_data, include_non_chat_roles=include_non_chat_roles
+            )
+        except ExtractionError as exc:
+            last_message_error = exc
+            continue
         if messages:
             return messages
 
     if conversation_count:
+        if last_message_error is not None:
+            raise last_message_error
         raise ExtractionError(
             "message extraction", "the share contains no visible non-empty messages"
         )
-    if decoded_count:
-        raise ExtractionError(
-            "conversation discovery",
-            f"decoded {decoded_count} payload(s), but none contained a recognizable conversation",
-        )
     raise ExtractionError(
-        "payload decoding",
-        f"found {len(payloads)} enqueue payload(s), but none could be decoded",
+        "conversation discovery",
+        f"resolved {len(roots)} root graph(s), but none contained a recognizable conversation",
     )
+
+
+def diagnose_html(html: str, include_non_chat_roles=False):
+    """Return structural diagnostics without URLs, payload text, or message content."""
+    roots, report = _resolved_payload_stream(html)
+    report.update(
+        {
+            "conversation_candidates": 0,
+            "message_extraction_failures": 0,
+            "visible_messages": 0,
+            "asset_references": 0,
+            "status": "error",
+            "failure_stage": None,
+        }
+    )
+    if not roots:
+        try:
+            _raise_payload_stream_failure(report)
+        except ExtractionError as exc:
+            report["failure_stage"] = exc.stage
+        return report
+
+    for root in roots:
+        conversation_data = find_conversation_data(root)
+        if conversation_data is None:
+            continue
+        report["conversation_candidates"] += 1
+        try:
+            messages = extract_rich_messages_from_data(
+                conversation_data, include_non_chat_roles=include_non_chat_roles
+            )
+        except ExtractionError:
+            report["message_extraction_failures"] += 1
+            continue
+        if messages and report["visible_messages"] == 0:
+            report["visible_messages"] = len(messages)
+            report["asset_references"] = sum(
+                len(message.assets) for message in messages
+            )
+
+    if report["visible_messages"]:
+        report["status"] = "ok"
+    elif report["conversation_candidates"]:
+        report["failure_stage"] = "message extraction"
+    else:
+        report["failure_stage"] = "conversation discovery"
+    return report
 
 
 def _relative_markdown_path(path, output_parent):
@@ -1142,6 +1410,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-roles", action="store_true", help="不输出说话人标记")
     parser.add_argument("--bold-roles", action="store_true", help="加粗说话人标记")
     parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="仅输出不含链接、载荷和正文的结构诊断",
+    )
+    parser.add_argument(
         "--download-assets",
         action="store_true",
         help="下载公开页面引用的图片、音频和文件",
@@ -1190,6 +1463,18 @@ def main(argv=None) -> int:
             html = fetch_html(source)
         else:
             html = read_html_file(source)
+        if args.diagnose:
+            if args.output or args.download_assets:
+                raise ExtractionError(
+                    "output", "--diagnose cannot be combined with output or asset download"
+                )
+            report = diagnose_html(
+                html, include_non_chat_roles=args.include_non_chat_roles
+            )
+            sys.stdout.write(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            )
+            return 0 if report["status"] == "ok" else 2
         rich_messages = _extract_rich_messages(
             html, include_non_chat_roles=args.include_non_chat_roles
         )

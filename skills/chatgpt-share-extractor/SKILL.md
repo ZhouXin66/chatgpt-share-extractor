@@ -14,7 +14,7 @@ Extract a public ChatGPT shared conversation with the bundled standard-library P
 3. Resolve this skill's directory from the loaded `SKILL.md`, then run `scripts/extract_chatgpt_share.py` with the requested input and output path. For file exports, pass `--download-assets` unless the user explicitly requests text only.
 4. If direct URL fetching fails because the execution environment has no permitted network path, use an available sanctioned browser or web-fetch capability to save the public page as HTML. On Windows, `Invoke-WebRequest` is an optional fallback, not a requirement.
 5. Run the extractor on the saved HTML and verify the reported visible-message and asset counts, output file, relative asset links, and `assets/assets.json` when assets were referenced.
-6. If parsing fails, read [references/format-notes.md](references/format-notes.md) before changing the parser.
+6. If parsing fails, run the same input with `--diagnose`, inspect only its structural counts and failure stage, then read [references/format-notes.md](references/format-notes.md) before changing the parser.
 
 ## Run the extractor
 
@@ -31,6 +31,14 @@ python "<skill-directory>/scripts/extract_chatgpt_share.py" share.html -o conver
 ```
 
 Use `--no-roles` to omit role labels or `--bold-roles` to bold them. Use `--assets-dir <path>` to override the default `assets/` folder beside the Markdown. Use `--strict-assets` only when the whole export must fail if any referenced asset is unavailable. Use `--asset-host <domain>` only with user intent when a legitimate public asset is hosted outside the built-in ChatGPT/OpenAI asset domains. Without `-o`, the script writes Markdown to stdout; avoid stdout when the conversation may be sensitive or terminal output is recorded.
+
+For safe structural diagnostics without exporting content:
+
+```bash
+python "<skill-directory>/scripts/extract_chatgpt_share.py" share.html --diagnose
+```
+
+Do not combine `--diagnose` with `-o` or `--download-assets`. Its JSON output intentionally omits the input URL, payload text, message text, filenames, and asset URLs.
 
 Asset download is best-effort by default. Keep the Markdown export when an expired pointer or unavailable public URL prevents one asset from being archived, and report the failure in `assets.json`. Never request cookies, tokens, or credentials to retrieve it.
 
@@ -61,7 +69,10 @@ Do not request cookies, account tokens, or login credentials. Do not attempt to 
 - For `URL validation`, correct the URL; do not broaden the allowed host without user intent.
 - For `fetch`, distinguish HTTP denial, timeout, and restricted network access before suggesting a fallback.
 - For `page recognition`, check whether the file is an error, login, or bot-challenge page.
-- For `payload decoding` or `conversation discovery`, read the technical reference and inspect only structural metadata by default.
+- For `JavaScript decoding`, distinguish invalid string escaping from a changed enqueue wrapper.
+- For `JSON decoding` or `control frame decoding`, distinguish serialized roots from typed stream frames.
+- For `reference resolution`, inspect root sizes, Promise-frame counts, back-references, and unresolved Promise counts without printing payload content.
+- For `conversation discovery`, inspect only semantic keys and structural metadata by default.
 - For `message extraction`, report that the share contained no visible non-empty messages.
 - For `asset download`, distinguish an unavailable public URL, disallowed host, expired link, and size-limit failure. Do not broaden the host allowlist without user intent.
 
