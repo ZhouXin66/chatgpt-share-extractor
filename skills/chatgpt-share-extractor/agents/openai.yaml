@@ -1,4 +1,4 @@
 interface:
   display_name: "ChatGPT Share Extractor"
-  short_description: "Archive public ChatGPT shares as Markdown with assets"
-  default_prompt: "Use $chatgpt-share-extractor to archive this public ChatGPT share as Markdown with its referenced assets."
+  short_description: "Export public ChatGPT share text as Markdown"
+  default_prompt: "Use $chatgpt-share-extractor to export this public ChatGPT share as Markdown with attachment notices."

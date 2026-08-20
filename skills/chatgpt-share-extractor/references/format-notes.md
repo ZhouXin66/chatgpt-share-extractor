@@ -65,7 +65,7 @@ Use `linear_conversation` when it exists. Entries may be node identifiers or res
 
 By default export only visible `user` and `assistant` messages. Skip messages marked by `is_visually_hidden_from_conversation`, `is_hidden`, `hidden`, `hide_in_conversation`, or `is_context_message`. Include other roles only when the user explicitly requests them; hidden messages remain excluded.
 
-## Rich message parts and assets
+## Rich message parts and attachments
 
 Treat `message.content.parts` as typed parts rather than concatenating arbitrary objects as JSON. Preserve string parts and public text fields such as `text`, `caption`, and `transcript`. Recognize image, audio, video, file, and attachment parts from their content type and fields such as:
 
@@ -74,9 +74,7 @@ Treat `message.content.parts` as typed parts rather than concatenating arbitrary
 - `filename`, `file_name`, `mime_type`, `alt_text`, or `caption`.
 - Attachment collections under the message, content, or metadata objects.
 
-Deduplicate repeated references within a message. Rewrite successfully archived references to relative Markdown links. If only a `file-service://` or `sandbox:` pointer is exposed and no public HTTPS URL can be resolved, keep an explicit unavailable-asset placeholder and record it in `assets.json`; never invent a private API endpoint.
-
-Download only HTTPS assets from the built-in ChatGPT/OpenAI host allowlist or an explicitly user-approved additional host. Revalidate redirects, reject credentials and non-default ports, bound per-file and total bytes, sanitize filenames, avoid collisions, deduplicate identical bytes by SHA-256, and exclude original signed URLs from the manifest.
+Deduplicate repeated structured references within a message and render them as lightweight blockquoted notices. Include the filename or public label when available. Leave ordinary Markdown links in message text unchanged. Do not download referenced files or invent a private endpoint for `file-service://` and `sandbox:` pointers.
 
 ## Failure triage
 
@@ -88,6 +86,6 @@ Download only HTTPS assets from the built-in ChatGPT/OpenAI host allowlist or an
 - **Decoded but no conversation:** Inspect key names and nesting. Prefer adding a semantic fallback over replacing the known fast path.
 - **Conversation but no messages:** Check whether `linear_conversation` changed from nodes to IDs, content moved away from `parts`, or every message is hidden/empty.
 
-Use `--diagnose` to print only structural counts such as enqueue values, frame kinds, array sizes, references, Promise markers, candidate conversations, visible-message count, and failure stage. Diagnostic output must never include the input URL, raw payload, message text, filenames, or asset URLs.
+Use `--diagnose` to print only structural counts such as enqueue values, frame kinds, array sizes, references, Promise markers, candidate conversations, visible-message count, attachment-reference count, and failure stage. Diagnostic output must never include the input URL, raw payload, message text, filenames, or attachment sources.
 
 Never place raw HTML, full payloads, share IDs, or extracted text into public issues or fixtures. Build the smallest synthetic fixture that reproduces a parser problem.

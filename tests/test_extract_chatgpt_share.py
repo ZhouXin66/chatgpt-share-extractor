@@ -4,9 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from email.message import Message
 from pathlib import Path
-from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,25 +97,6 @@ def sample_root():
             }
         }
     }
-
-
-class FakeAssetResponse(io.BytesIO):
-    def __init__(self, body, url, content_type, filename):
-        super().__init__(body)
-        self._url = url
-        self.headers = Message()
-        self.headers["Content-Type"] = content_type
-        self.headers["Content-Length"] = str(len(body))
-        self.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-    def geturl(self):
-        return self._url
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.close()
 
 
 class UrlValidationTests(unittest.TestCase):
@@ -304,7 +283,7 @@ class RichMessageTests(unittest.TestCase):
             ),
         )
 
-    def test_renders_structured_text_and_assets_without_internal_json(self):
+    def test_renders_structured_text_and_attachment_notices_without_internal_json(self):
         node = {
             "message": {
                 "author": {"role": "assistant"},
@@ -336,12 +315,13 @@ class RichMessageTests(unittest.TestCase):
         )
         rendered = extractor.render_rich_message(messages[0])
         self.assertIn("Result", rendered)
-        self.assertIn("![Diagram]", rendered)
-        self.assertIn("[data.csv]", rendered)
+        self.assertIn("原对话包含图片：diagram.png", rendered)
+        self.assertIn("原对话包含文件：data.csv", rendered)
+        self.assertIn("本导出仅保留附件提示", rendered)
         self.assertNotIn('"content_type"', rendered)
-        self.assertEqual(len(messages[0].assets), 2)
+        self.assertEqual(len(messages[0].attachments), 2)
 
-    def test_discovers_visible_markdown_image_and_sandbox_file_links(self):
+    def test_preserves_visible_markdown_links_without_extra_notices(self):
         text = (
             "![Plot](https://files.oaiusercontent.com/plot.png)\n\n"
             "[Download](sandbox:/mnt/data/result.csv)"
@@ -356,12 +336,10 @@ class RichMessageTests(unittest.TestCase):
         messages = extractor.extract_rich_messages_from_data(
             {"mapping": {"node": node}, "linear_conversation": ["node"]}
         )
-        self.assertEqual(len(messages[0].assets), 2)
-        self.assertEqual(messages[0].assets[0].kind, "image")
-        self.assertEqual(messages[0].assets[1].pointer, "sandbox:/mnt/data/result.csv")
+        self.assertEqual(messages[0].attachments, [])
         self.assertEqual(extractor.render_rich_message(messages[0]), text)
 
-    def test_discovers_asset_nested_in_multimodal_part(self):
+    def test_discovers_attachment_nested_in_multimodal_part(self):
         node = {
             "message": {
                 "author": {"role": "assistant"},
@@ -385,109 +363,26 @@ class RichMessageTests(unittest.TestCase):
         messages = extractor.extract_rich_messages_from_data(
             {"mapping": {"node": node}, "linear_conversation": ["node"]}
         )
-        self.assertEqual(len(messages[0].assets), 1)
-        self.assertEqual(messages[0].assets[0].filename, "nested.webp")
+        self.assertEqual(len(messages[0].attachments), 1)
+        self.assertEqual(messages[0].attachments[0].filename, "nested.webp")
 
 
-class AssetDownloadTests(unittest.TestCase):
-    def test_downloads_asset_rewrites_markdown_and_writes_private_manifest(self):
-        asset_url = "https://files.oaiusercontent.com/diagram.png?signature=secret"
-        asset = extractor.AssetReference(
+class AttachmentNoticeCliTests(unittest.TestCase):
+    def test_notice_without_filename_uses_type_only(self):
+        notice = extractor.AttachmentNotice(
             kind="image",
-            filename="diagram.png",
-            message_index=0,
-            part_index=1,
-            url=asset_url,
-            mime_type="image/png",
-            alt_text="Diagram",
-        )
-        messages = [extractor.RichMessage("assistant", ["Image", asset])]
-        response = FakeAssetResponse(
-            b"synthetic-png", asset_url, "image/png", "../../diagram.png"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "conversation.md"
-            with mock.patch.object(extractor, "_open_asset", return_value=response):
-                downloaded, failures, manifest_path = extractor.download_asset_references(
-                    messages, output_path
-                )
-            self.assertEqual((downloaded, failures), (1, 0))
-            self.assertTrue((Path(directory) / "assets" / "diagram.png").is_file())
-            markdown = extractor.rich_to_markdown(
-                messages,
-                output_parent=output_path.parent,
-                assets_requested=True,
-            )
-            self.assertIn("assets/diagram.png", markdown)
-            manifest = manifest_path.read_text(encoding="utf-8")
-            self.assertNotIn("signature=secret", manifest)
-            self.assertIn('"status": "downloaded"', manifest)
-
-    def test_size_limit_failure_cleans_partial_file(self):
-        asset_url = "https://files.oaiusercontent.com/large.bin"
-        asset = extractor.AssetReference(
-            kind="file",
-            filename="large.bin",
             message_index=0,
             part_index=0,
-            url=asset_url,
+            source="file-service://file-example",
         )
-        messages = [extractor.RichMessage("assistant", [asset])]
-        response = FakeAssetResponse(b"12345678", asset_url, "application/octet-stream", "large.bin")
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "conversation.md"
-            with mock.patch.object(extractor, "_open_asset", return_value=response):
-                downloaded, failures, _ = extractor.download_asset_references(
-                    messages, output_path, max_asset_bytes=4
-                )
-            self.assertEqual((downloaded, failures), (0, 1))
-            self.assertEqual(
-                [path.name for path in (Path(directory) / "assets").iterdir()],
-                ["assets.json"],
-            )
-
-    def test_unresolved_pointer_is_manifested_without_aborting(self):
-        asset = extractor.AssetReference(
-            kind="file",
-            filename="report.pdf",
-            message_index=0,
-            part_index=0,
-            pointer="file-service://file-example",
-            mime_type="application/pdf",
+        message = extractor.RichMessage("user", [notice])
+        self.assertEqual(
+            extractor.render_rich_message(message),
+            "> [原对话包含图片；本导出仅保留附件提示]",
         )
-        messages = [extractor.RichMessage("assistant", [asset])]
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "conversation.md"
-            downloaded, failures, manifest_path = extractor.download_asset_references(
-                messages, output_path
-            )
-            self.assertEqual((downloaded, failures), (0, 1))
-            self.assertIn(
-                "附件未归档",
-                extractor.rich_to_markdown(
-                    messages,
-                    output_parent=output_path.parent,
-                    assets_requested=True,
-                ),
-            )
-            self.assertTrue(manifest_path.is_file())
 
-    def test_rejects_untrusted_or_non_https_asset_targets(self):
-        with self.assertRaisesRegex(extractor.ExtractionError, "not allowed"):
-            extractor._validate_asset_target(
-                "https://example.com/file.png", extractor.DEFAULT_ASSET_HOSTS
-            )
-        with self.assertRaisesRegex(extractor.ExtractionError, "HTTPS"):
-            extractor._validate_asset_target(
-                "http://files.oaiusercontent.com/file.png",
-                extractor.DEFAULT_ASSET_HOSTS,
-            )
-        with self.assertRaisesRegex(extractor.ExtractionError, "literal IP"):
-            extractor._normalized_asset_hosts(["127.0.0.1"])
-
-    def test_cli_downloads_asset_and_writes_relative_link(self):
-        asset_url = "https://files.oaiusercontent.com/report.csv"
-        asset_node = {
+    def test_cli_marks_attachment_without_creating_assets_directory(self):
+        attachment_node = {
             "message": {
                 "author": {"role": "assistant"},
                 "content": {
@@ -495,7 +390,7 @@ class AssetDownloadTests(unittest.TestCase):
                         "Download",
                         {
                             "content_type": "file_attachment",
-                            "download_url": asset_url,
+                            "download_url": "https://files.oaiusercontent.com/report.csv",
                             "filename": "report.csv",
                             "mime_type": "text/csv",
                         },
@@ -509,8 +404,8 @@ class AssetDownloadTests(unittest.TestCase):
                 "routes/share.$shareId.($action)": {
                     "serverResponse": {
                         "data": {
-                            "mapping": {"asset": asset_node},
-                            "linear_conversation": ["asset"],
+                            "mapping": {"attachment": attachment_node},
+                            "linear_conversation": ["attachment"],
                         }
                     }
                 }
@@ -521,31 +416,21 @@ class AssetDownloadTests(unittest.TestCase):
             input_path = Path(directory) / "share.html"
             output_path = Path(directory) / "conversation.md"
             input_path.write_text(html, encoding="utf-8")
-            response = FakeAssetResponse(
-                b"a,b\n1,2\n", asset_url, "text/csv", "report.csv"
-            )
             stdout = io.StringIO()
-            with mock.patch.object(
-                extractor, "_open_asset", return_value=response
-            ), contextlib.redirect_stdout(stdout):
+            with contextlib.redirect_stdout(stdout):
                 code = extractor.main(
-                    [
-                        str(input_path),
-                        "-o",
-                        str(output_path),
-                        "--download-assets",
-                        "--json-summary",
-                    ]
+                    [str(input_path), "-o", str(output_path), "--json-summary"]
                 )
             self.assertEqual(code, 0)
             report = json.loads(stdout.getvalue())
-            self.assertEqual(report["assets_downloaded"], 1)
-            self.assertEqual(report["assets_unavailable"], 0)
-            self.assertTrue(report["manifest"].endswith("assets.json"))
+            self.assertEqual(report["attachments"], 1)
+            self.assertNotIn("assets_downloaded", report)
+            self.assertNotIn("manifest", report)
             self.assertIn(
-                "assets/report.csv", output_path.read_text(encoding="utf-8")
+                "原对话包含文件：report.csv",
+                output_path.read_text(encoding="utf-8"),
             )
-            self.assertTrue((Path(directory) / "assets" / "assets.json").is_file())
+            self.assertFalse((Path(directory) / "assets").exists())
 
 
 class MarkdownAndCliTests(unittest.TestCase):
@@ -601,10 +486,9 @@ class MarkdownAndCliTests(unittest.TestCase):
             report = json.loads(stdout.getvalue())
             self.assertEqual(report["status"], "ok")
             self.assertEqual(report["messages"], 2)
-            self.assertEqual(report["assets_downloaded"], 0)
-            self.assertEqual(report["assets_unavailable"], 0)
+            self.assertEqual(report["attachments"], 0)
             self.assertEqual(report["output"], str(output_path))
-            self.assertIsNone(report["manifest"])
+            self.assertNotIn("manifest", report)
             self.assertNotIn("你好", stdout.getvalue())
 
     def test_cli_json_summary_reports_safe_failure(self):

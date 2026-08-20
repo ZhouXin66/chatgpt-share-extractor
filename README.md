@@ -8,7 +8,7 @@
 
 - 仅依赖 Python 3 标准库。
 - 保留当前对话分支、Markdown、代码块、表格和公式文本。
-- 可将公开页面引用的图片、音频和文件归档到 Markdown 同级的 `assets/`，并生成不含签名 URL 的 `assets.json`。
+- 对图片、音频、视频和文件保留清晰的附件提示；能识别时同时保留文件名。
 - 默认添加 `用户：`、`ChatGPT：` 等角色标签。
 - 默认只输出可见的用户/助手消息，并过滤隐藏或上下文消息。
 - 从多个页面载荷中按数据结构识别对话，不依赖“第一个”或“最大”载荷。
@@ -29,8 +29,7 @@ skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py
 ```bash
 python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
   "https://chatgpt.com/share/<id>" \
-  -o conversation.md \
-  --download-assets
+  -o conversation.md
 ```
 
 解析已保存的 HTML：
@@ -38,8 +37,7 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 ```bash
 python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
   share.html \
-  -o conversation.md \
-  --download-assets
+  -o conversation.md
 ```
 
 可选参数：
@@ -52,15 +50,9 @@ python skills/chatgpt-share-extractor/scripts/extract_chatgpt_share.py \
 | `--no-roles` | 不输出角色标签 |
 | `--bold-roles` | 将角色标签加粗 |
 | `--diagnose` | 只输出不含 URL、载荷和正文的结构诊断 JSON |
-| `--download-assets` | 归档页面公开引用的图片、音频和文件 |
-| `--assets-dir` | 指定附件目录；默认使用 Markdown 同级的 `assets/` |
-| `--asset-host` | 显式增加一个允许下载的 HTTPS 资源域名，可重复指定 |
-| `--max-asset-mib` | 设置单个附件的大小上限 |
-| `--max-total-assets-mib` | 设置全部附件的累计下载上限 |
-| `--strict-assets` | 任一附件不可用时让导出失败 |
 | `--include-non-chat-roles` | 同时导出非用户/助手角色，隐藏消息仍会跳过 |
 
-附件下载默认采用尽力而为策略。无法公开下载的附件会在 Markdown 和 `assets.json` 中标记，但不会阻止其余对话导出。工具不会为 `file-service://` 指针猜测私有接口，也不会请求 Cookie 或令牌。
+公开分享数据通常只包含附件元数据或内部指针，而不包含可独立归档的文件内容。因此工具只在 Markdown 中标注原对话包含的图片或文件，并在能够识别时写出文件名；它不会下载附件、创建 `assets/`，也不会请求 Cookie、令牌或猜测私有接口。消息正文中原本存在的普通 Markdown 链接会原样保留。
 
 自动化调用可增加 `--json-summary`，让工具只输出一行包含状态、消息数、附件数和输出路径的 JSON；其中不包含分享 URL、消息正文或附件 URL。如果调用方不需要成功信息，可改用 `--quiet`。这两个模式互斥，并且都要求指定 `-o`。
 
@@ -101,7 +93,7 @@ $chatgpt-share-extractor 把这个公开分享链接导出为 Markdown：<链接
 
 ## 隐私与安全
 
-分享 URL 相当于“持有链接即可访问”的凭证。下载的 HTML、附件和导出的 Markdown 可能包含完整对话、代码、密钥、个人信息或其他敏感内容。
+分享 URL 相当于“持有链接即可访问”的凭证。下载的 HTML 和导出的 Markdown 可能包含完整对话、代码、密钥、个人信息或其他敏感内容。
 
 - 不要将真实分享 URL、HTML 或导出结果提交到 Git。
 - 不要将原始载荷粘贴到公开 Issue。
@@ -135,7 +127,6 @@ ChatGPT 分享页曾将对话数据放入 `enqueue("...")` 脚本载荷，并使
 - `reference resolution`
 - `conversation discovery`
 - `message extraction`
-- `asset download`
 - `output`
 
 页面改版时，请先根据阶段判断是网络、错误页、载荷编码还是对话结构发生变化。

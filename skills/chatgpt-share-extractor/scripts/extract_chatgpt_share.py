@@ -2,14 +2,9 @@
 """Extract visible messages from a public ChatGPT share page as Markdown."""
 
 import argparse
-import hashlib
-import ipaddress
 import json
-import mimetypes
-import os
 import re
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -23,49 +18,11 @@ DEFAULT_UA = (
 )
 ALLOWED_HOST = "chatgpt.com"
 MAX_INPUT_BYTES = 50 * 1024 * 1024
-DEFAULT_MAX_ASSET_BYTES = 25 * 1024 * 1024
-DEFAULT_MAX_TOTAL_ASSET_BYTES = 100 * 1024 * 1024
-DEFAULT_ASSET_HOSTS = (
-    "chatgpt.com",
-    "openai.com",
-    "oaiusercontent.com",
-    "oaistatic.com",
-)
 ENQUEUE_RE = re.compile(
     r'(?:window\.__reactRouterContext\.streamController\.)?'
     r'enqueue\(\s*"((?:[^"\\]|\\.)*)"\s*\)'
 )
 CONTROL_FRAME_RE = re.compile(r"^([A-Z])(\d+):(.*)\s*$", re.DOTALL)
-MARKDOWN_LINK_RE = re.compile(
-    r'(!?)\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+"[^"]*")?\s*\)'
-)
-ARCHIVABLE_EXTENSIONS = {
-    ".csv",
-    ".doc",
-    ".docx",
-    ".gif",
-    ".jpeg",
-    ".jpg",
-    ".json",
-    ".m4a",
-    ".md",
-    ".mp3",
-    ".mp4",
-    ".ogg",
-    ".pdf",
-    ".png",
-    ".ppt",
-    ".pptx",
-    ".svg",
-    ".txt",
-    ".wav",
-    ".webm",
-    ".webp",
-    ".xls",
-    ".xlsx",
-    ".zip",
-}
-
 POWERSHELL_HINT = """可选的 Windows 回退方案：
   Invoke-WebRequest -Uri "<share-url>" -UseBasicParsing -TimeoutSec 40 -UserAgent "Mozilla/5.0" |
     Select-Object -ExpandProperty Content | Out-File share.html -Encoding utf8
@@ -87,22 +44,17 @@ class ExtractionError(Exception):
 
 
 @dataclass
-class AssetReference:
-    """One visible image, audio item, or file referenced by a message."""
+class AttachmentNotice:
+    """A lightweight marker for media or a file named by public share data."""
 
     kind: str
-    filename: str
     message_index: int
     part_index: int
-    url: str | None = None
-    pointer: str | None = None
+    filename: str | None = None
+    source: str | None = None
     mime_type: str | None = None
     alt_text: str = ""
     render_inline: bool = True
-    local_path: Path | None = None
-    sha256: str | None = None
-    size_bytes: int | None = None
-    error: str | None = None
 
 
 @dataclass
@@ -110,11 +62,11 @@ class RichMessage:
     """A visible message whose parts retain their public content types."""
 
     role: str
-    parts: list[str | AssetReference] = field(default_factory=list)
+    parts: list[str | AttachmentNotice] = field(default_factory=list)
 
     @property
-    def assets(self) -> list[AssetReference]:
-        return [part for part in self.parts if isinstance(part, AssetReference)]
+    def attachments(self) -> list[AttachmentNotice]:
+        return [part for part in self.parts if isinstance(part, AttachmentNotice)]
 
 
 @dataclass
@@ -674,10 +626,10 @@ def _contains_nested_key(value, keys, max_depth=5):
     return False
 
 
-def _guess_asset_kind(content_type, mime_type, filename, url):
+def _guess_attachment_kind(content_type, mime_type, filename, source):
     hints = " ".join(
         value.lower()
-        for value in (content_type, mime_type, filename, url)
+        for value in (content_type, mime_type, filename, source)
         if isinstance(value, str)
     )
     if "image" in hints or re.search(r"\.(png|jpe?g|gif|webp|svg)(?:$|[?#])", hints):
@@ -697,7 +649,7 @@ def _filename_from_source(source):
     return candidate or None
 
 
-def _asset_from_mapping(value, message_index, part_index, force=False):
+def _attachment_from_mapping(value, message_index, part_index, force=False):
     if not isinstance(value, dict):
         return None
     content_type = _first_nested_string(value, ("content_type", "type"), 2)
@@ -706,7 +658,7 @@ def _asset_from_mapping(value, message_index, part_index, force=False):
     )
     if not mime_type and isinstance(content_type, str) and "/" in content_type:
         mime_type = content_type
-    url = _first_nested_string(
+    public_source = _first_nested_string(
         value,
         ("download_url", "asset_url", "image_url", "audio_url", "src", "url"),
         5,
@@ -717,7 +669,7 @@ def _asset_from_mapping(value, message_index, part_index, force=False):
     filename = _first_nested_string(
         value, ("filename", "file_name", "name", "title"), 4
     )
-    asset_keys = {
+    attachment_keys = {
         "asset_pointer",
         "file_pointer",
         "download_url",
@@ -729,30 +681,32 @@ def _asset_from_mapping(value, message_index, part_index, force=False):
         "mime_type",
     }
     type_hint = (content_type or "").lower()
-    has_asset_type = any(
+    has_attachment_type = any(
         token in type_hint for token in ("image", "audio", "video", "file", "attachment")
     )
-    if not (force or has_asset_type or _contains_nested_key(value, asset_keys)):
+    if not (
+        force
+        or has_attachment_type
+        or _contains_nested_key(value, attachment_keys)
+    ):
         return None
 
-    if isinstance(url, str) and urlsplit(url).scheme.lower() not in {"http", "https"}:
-        pointer = pointer or url
-        url = None
-    filename = filename or _filename_from_source(url) or _filename_from_source(pointer)
-    kind = _guess_asset_kind(content_type, mime_type, filename, url)
-    if not filename:
-        guessed_extension = mimetypes.guess_extension(mime_type or "") or ""
-        filename = f"{kind}-{message_index + 1:03d}-{part_index + 1:02d}{guessed_extension}"
+    source = pointer or public_source
+    filename = (
+        filename
+        or _filename_from_source(public_source)
+        or _filename_from_source(pointer)
+    )
+    kind = _guess_attachment_kind(content_type, mime_type, filename, source)
     alt_text = _first_nested_string(value, ("alt_text", "alt", "caption"), 3)
-    return AssetReference(
+    return AttachmentNotice(
         kind=kind,
-        filename=filename,
         message_index=message_index,
         part_index=part_index,
-        url=url,
-        pointer=pointer,
+        filename=filename,
+        source=source,
         mime_type=mime_type,
-        alt_text=alt_text or filename,
+        alt_text=alt_text or "",
     )
 
 
@@ -767,32 +721,6 @@ def _structured_text(value):
     if isinstance(content, str) and content.strip():
         return content
     return None
-
-
-def _markdown_asset_references(text, message_index, start_index):
-    for offset, match in enumerate(MARKDOWN_LINK_RE.finditer(text)):
-        image_marker, label, angle_target, plain_target = match.groups()
-        target = angle_target or plain_target
-        parsed = urlsplit(target)
-        suffix = Path(parsed.path).suffix.lower()
-        if not image_marker and not (
-            parsed.scheme.lower() == "sandbox" or suffix in ARCHIVABLE_EXTENSIONS
-        ):
-            continue
-        url = target if parsed.scheme.lower() in {"http", "https"} else None
-        pointer = target if url is None else None
-        filename = _filename_from_source(target) or label or "asset"
-        kind = "image" if image_marker else _guess_asset_kind(None, None, filename, url)
-        yield AssetReference(
-            kind=kind,
-            filename=filename,
-            message_index=message_index,
-            part_index=start_index + offset,
-            url=url,
-            pointer=pointer,
-            alt_text=label or filename,
-            render_inline=False,
-        )
 
 
 def _iter_attachment_mappings(message, content, metadata):
@@ -824,12 +752,21 @@ def _iter_attachment_mappings(message, content, metadata):
                     yield value
 
 
-def _asset_identity(asset):
-    if asset.pointer:
-        return ("pointer", asset.pointer)
-    if asset.url:
-        return ("url", asset.url)
-    return ("file", asset.filename.casefold(), asset.mime_type or "")
+def _attachment_identity(attachment):
+    if attachment.source:
+        return ("source", attachment.source)
+    if attachment.filename:
+        return (
+            "file",
+            attachment.filename.casefold(),
+            attachment.mime_type or "",
+        )
+    return (
+        "part",
+        attachment.message_index,
+        attachment.part_index,
+        attachment.kind,
+    )
 
 
 def _message_is_visible(message, include_non_chat_roles=False):
@@ -878,24 +815,20 @@ def extract_rich_messages_from_data(
                 raw_parts.append(direct_text)
 
         rendered_parts = []
-        known_assets = set()
+        known_attachments = set()
         text_sources = []
-        markdown_assets = []
         for part_index, part in enumerate(raw_parts):
             if isinstance(part, str):
                 if part.strip():
                     rendered_parts.append(part)
                     text_sources.append(part)
-                    for asset in _markdown_asset_references(part, message_index, 0):
-                        asset.part_index = len(raw_parts) + len(markdown_assets)
-                        markdown_assets.append(asset)
                 continue
-            asset = _asset_from_mapping(part, message_index, part_index)
-            if asset is not None:
-                identity = _asset_identity(asset)
-                if identity not in known_assets:
-                    known_assets.add(identity)
-                    rendered_parts.append(asset)
+            attachment = _attachment_from_mapping(part, message_index, part_index)
+            if attachment is not None:
+                identity = _attachment_identity(attachment)
+                if identity not in known_attachments:
+                    known_attachments.add(identity)
+                    rendered_parts.append(attachment)
                 continue
             text = _structured_text(part)
             if text:
@@ -903,28 +836,20 @@ def extract_rich_messages_from_data(
                 text_sources.append(text)
 
         visible_text = "\n".join(text_sources)
-        for asset in markdown_assets:
-            identity = _asset_identity(asset)
-            if identity not in known_assets:
-                known_assets.add(identity)
-                rendered_parts.append(asset)
-        next_part_index = len(raw_parts) + len(markdown_assets)
+        next_part_index = len(raw_parts)
         for attachment in _iter_attachment_mappings(message, content, metadata):
-            asset = _asset_from_mapping(
+            notice = _attachment_from_mapping(
                 attachment, message_index, next_part_index, force=True
             )
             next_part_index += 1
-            if asset is None or _asset_identity(asset) in known_assets:
+            if notice is None or _attachment_identity(notice) in known_attachments:
                 continue
-            known_assets.add(_asset_identity(asset))
-            sources = tuple(
-                source for source in (asset.url, asset.pointer) if isinstance(source, str)
-            )
-            sandbox_source = f"sandbox:/mnt/data/{asset.filename}"
-            asset.render_inline = not any(source in visible_text for source in sources) and (
-                sandbox_source not in visible_text
-            )
-            rendered_parts.append(asset)
+            known_attachments.add(_attachment_identity(notice))
+            sources = [notice.source] if isinstance(notice.source, str) else []
+            if notice.filename:
+                sources.append(f"sandbox:/mnt/data/{notice.filename}")
+            notice.render_inline = not any(source in visible_text for source in sources)
+            rendered_parts.append(notice)
 
         if rendered_parts:
             messages.append(RichMessage(role=role, parts=rendered_parts))
@@ -972,7 +897,7 @@ def diagnose_html(html: str, include_non_chat_roles=False):
             "conversation_candidates": 0,
             "message_extraction_failures": 0,
             "visible_messages": 0,
-            "asset_references": 0,
+            "attachment_references": 0,
             "status": "error",
             "failure_stage": None,
         }
@@ -998,8 +923,8 @@ def diagnose_html(html: str, include_non_chat_roles=False):
             continue
         if messages and report["visible_messages"] == 0:
             report["visible_messages"] = len(messages)
-            report["asset_references"] = sum(
-                len(message.assets) for message in messages
+            report["attachment_references"] = sum(
+                len(message.attachments) for message in messages
             )
 
     if report["visible_messages"]:
@@ -1011,62 +936,32 @@ def diagnose_html(html: str, include_non_chat_roles=False):
     return report
 
 
-def _relative_markdown_path(path, output_parent):
-    return Path(os.path.relpath(path, output_parent)).as_posix()
-
-
-def _markdown_target(value):
-    return f"<{str(value).replace('>', '%3E')}>"
-
-
-def _render_asset(asset, output_parent=None, assets_requested=False):
-    label = (asset.alt_text or asset.filename).replace("[", "\\[").replace(
-        "]", "\\]"
-    )
-    if asset.local_path is not None and output_parent is not None:
-        target = _relative_markdown_path(asset.local_path, output_parent)
-    elif asset.url and not assets_requested:
-        target = asset.url
-    elif asset.pointer and asset.pointer.startswith("sandbox:") and not assets_requested:
-        target = asset.pointer
+def _render_attachment_notice(attachment):
+    kind_names = {
+        "image": "图片",
+        "audio": "音频",
+        "video": "视频",
+        "file": "文件",
+    }
+    kind = kind_names.get(attachment.kind, "附件")
+    detail = attachment.filename or attachment.alt_text
+    if detail:
+        detail = re.sub(r"\s+", " ", detail).strip()
+        detail = detail.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        detail = f"：{detail}"
     else:
-        reason = asset.error or "公开页面未提供可下载 URL"
-        return f"[附件未归档：{asset.filename}（{reason}）]"
-    if asset.kind == "image":
-        return f"![{label}]({_markdown_target(target)})"
-    return f"[{label}]({_markdown_target(target)})"
+        detail = ""
+    return f"> [原对话包含{kind}{detail}；本导出仅保留附件提示]"
 
 
-def render_rich_message(message, output_parent=None, assets_requested=False):
-    replacements = []
-    for asset in message.assets:
-        if asset.local_path is None or output_parent is None:
-            continue
-        target = _relative_markdown_path(asset.local_path, output_parent)
-        for source in (
-            asset.url,
-            asset.pointer,
-            f"sandbox:/mnt/data/{asset.filename}",
-        ):
-            if isinstance(source, str) and source:
-                replacements.append((source, target))
-
+def render_rich_message(message):
     chunks = []
     for part in message.parts:
         if isinstance(part, str):
-            text = part
-            for source, target in replacements:
-                text = text.replace(source, target)
-            if text.strip():
-                chunks.append(text.strip())
+            if part.strip():
+                chunks.append(part.strip())
         elif part.render_inline:
-            chunks.append(
-                _render_asset(
-                    part,
-                    output_parent=output_parent,
-                    assets_requested=assets_requested,
-                )
-            )
+            chunks.append(_render_attachment_notice(part))
     return "\n\n".join(chunk for chunk in chunks if chunk).strip()
 
 
@@ -1074,11 +969,12 @@ def extract_messages_from_data(data, include_non_chat_roles=False) -> list[tuple
     rich_messages = extract_rich_messages_from_data(
         data, include_non_chat_roles=include_non_chat_roles
     )
-    return [
-        (message.role, render_rich_message(message))
-        for message in rich_messages
-        if render_rich_message(message)
-    ]
+    messages = []
+    for message in rich_messages:
+        text = render_rich_message(message)
+        if text:
+            messages.append((message.role, text))
+    return messages
 
 
 def extract_messages(html: str, include_non_chat_roles=False) -> list[tuple[str, str]]:
@@ -1086,278 +982,12 @@ def extract_messages(html: str, include_non_chat_roles=False) -> list[tuple[str,
     rich_messages = _extract_rich_messages(
         html, include_non_chat_roles=include_non_chat_roles
     )
-    return [
-        (message.role, render_rich_message(message))
-        for message in rich_messages
-        if render_rich_message(message)
-    ]
-
-
-def _host_is_allowed(hostname, allowed_hosts):
-    host = (hostname or "").lower().rstrip(".")
-    return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts)
-
-
-def _normalized_asset_hosts(additional_hosts):
-    hosts = list(DEFAULT_ASSET_HOSTS)
-    for raw_host in additional_hosts:
-        host = (raw_host or "").strip().lower().rstrip(".")
-        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host):
-            raise ExtractionError("asset download", "an additional asset host is invalid")
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            pass
-        else:
-            raise ExtractionError(
-                "asset download", "literal IP addresses cannot be added as asset hosts"
-            )
-        if "." not in host:
-            raise ExtractionError(
-                "asset download", "an additional asset host must be a full domain name"
-            )
-        hosts.append(host)
-    return tuple(dict.fromkeys(hosts))
-
-
-def _validate_asset_target(url, allowed_hosts):
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError as exc:
-        raise ExtractionError("asset download", "asset URL is malformed") from exc
-    if parsed.scheme.lower() != "https":
-        raise ExtractionError("asset download", "asset URL must use HTTPS")
-    if parsed.username or parsed.password:
-        raise ExtractionError("asset download", "asset URL must not contain credentials")
-    if port not in (None, 443):
-        raise ExtractionError("asset download", "asset URL uses a non-default port")
-    if not _host_is_allowed(hostname, allowed_hosts):
-        raise ExtractionError(
-            "asset download", f"asset host is not allowed: {hostname or 'missing host'}"
-        )
-
-
-class _SafeAssetRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self, allowed_hosts):
-        super().__init__()
-        self.allowed_hosts = allowed_hosts
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _validate_asset_target(newurl, self.allowed_hosts)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def _open_asset(url, allowed_hosts):
-    _validate_asset_target(url, allowed_hosts)
-    request = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-    opener = urllib.request.build_opener(_SafeAssetRedirectHandler(allowed_hosts))
-    return opener.open(request, timeout=30)
-
-
-def _safe_asset_filename(name, mime_type=None):
-    candidate = unquote(Path(name or "asset").name)
-    candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", candidate).strip(" .")
-    if not candidate:
-        candidate = "asset"
-    stem = Path(candidate).stem[:100] or "asset"
-    suffix = Path(candidate).suffix[:20]
-    if not suffix and mime_type:
-        suffix = mimetypes.guess_extension(mime_type.split(";", 1)[0].strip()) or ""
-    if stem.upper() in {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        "COM1",
-        "COM2",
-        "COM3",
-        "COM4",
-        "COM5",
-        "COM6",
-        "COM7",
-        "COM8",
-        "COM9",
-        "LPT1",
-        "LPT2",
-        "LPT3",
-        "LPT4",
-        "LPT5",
-        "LPT6",
-        "LPT7",
-        "LPT8",
-        "LPT9",
-    }:
-        stem = "_" + stem
-    return stem + suffix
-
-
-def _unique_destination(directory, filename):
-    candidate = directory / filename
-    counter = 2
-    while candidate.exists():
-        candidate = directory / f"{Path(filename).stem}-{counter}{Path(filename).suffix}"
-        counter += 1
-    return candidate
-
-
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as source:
-        while True:
-            chunk = source.read(64 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _copy_asset_result(source, target):
-    target.local_path = source.local_path
-    target.sha256 = source.sha256
-    target.size_bytes = source.size_bytes
-    target.mime_type = source.mime_type
-    target.error = source.error
-
-
-def download_asset_references(
-    messages,
-    output_path,
-    assets_dir=None,
-    additional_hosts=(),
-    max_asset_bytes=DEFAULT_MAX_ASSET_BYTES,
-    max_total_bytes=DEFAULT_MAX_TOTAL_ASSET_BYTES,
-    strict=False,
-):
-    assets = [asset for message in messages for asset in message.assets]
-    if not assets:
-        return 0, 0, None
-
-    output_path = Path(output_path)
-    output_parent = output_path.resolve().parent
-    directory = Path(assets_dir).resolve() if assets_dir else output_parent / "assets"
-    directory.mkdir(parents=True, exist_ok=True)
-    allowed_hosts = _normalized_asset_hosts(additional_hosts)
-
-    source_cache = {}
-    hash_cache = {}
-    downloaded_total = 0
-    for asset in assets:
-        cache_key = asset.url or asset.pointer or _asset_identity(asset)
-        if cache_key in source_cache:
-            _copy_asset_result(source_cache[cache_key], asset)
-            continue
-        source_cache[cache_key] = asset
-        if not asset.url:
-            asset.error = "公开页面未提供 HTTPS 下载 URL"
-            continue
-
-        temporary_path = None
-        try:
-            with _open_asset(asset.url, allowed_hosts) as response:
-                final_url = response.geturl() if hasattr(response, "geturl") else asset.url
-                _validate_asset_target(final_url, allowed_hosts)
-                headers = response.headers
-                response_mime = (
-                    headers.get_content_type()
-                    if hasattr(headers, "get_content_type")
-                    else headers.get("Content-Type", "").split(";", 1)[0]
-                )
-                if response_mime in {"text/html", "application/xhtml+xml"}:
-                    raise ExtractionError(
-                        "asset download", "asset response was an HTML page"
-                    )
-                declared_length = headers.get("Content-Length")
-                if declared_length and int(declared_length) > max_asset_bytes:
-                    raise ExtractionError(
-                        "asset download", "asset exceeds the per-file size limit"
-                    )
-                header_name = (
-                    headers.get_filename() if hasattr(headers, "get_filename") else None
-                )
-                asset.mime_type = response_mime or asset.mime_type
-                filename = _safe_asset_filename(
-                    header_name or asset.filename, asset.mime_type
-                )
-                handle, temporary_name = tempfile.mkstemp(
-                    prefix=".asset-", dir=directory
-                )
-                os.close(handle)
-                temporary_path = Path(temporary_name)
-                digest = hashlib.sha256()
-                asset_size = 0
-                with temporary_path.open("wb") as output:
-                    while True:
-                        chunk = response.read(64 * 1024)
-                        if not chunk:
-                            break
-                        asset_size += len(chunk)
-                        downloaded_total += len(chunk)
-                        if asset_size > max_asset_bytes:
-                            raise ExtractionError(
-                                "asset download", "asset exceeds the per-file size limit"
-                            )
-                        if downloaded_total > max_total_bytes:
-                            raise ExtractionError(
-                                "asset download", "assets exceed the total size limit"
-                            )
-                        digest.update(chunk)
-                        output.write(chunk)
-                sha256 = digest.hexdigest()
-                if sha256 in hash_cache:
-                    temporary_path.unlink(missing_ok=True)
-                    asset.local_path = hash_cache[sha256]
-                else:
-                    preferred = directory / filename
-                    if preferred.is_file() and _sha256_file(preferred) == sha256:
-                        temporary_path.unlink(missing_ok=True)
-                        asset.local_path = preferred.resolve()
-                    else:
-                        destination = _unique_destination(directory, filename)
-                        temporary_path.replace(destination)
-                        asset.local_path = destination.resolve()
-                    hash_cache[sha256] = asset.local_path
-                asset.sha256 = sha256
-                asset.size_bytes = asset_size
-        except (ExtractionError, urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-            asset.error = exc.message if isinstance(exc, ExtractionError) else type(exc).__name__
-
-    manifest_assets = []
-    for asset in assets:
-        manifest_assets.append(
-            {
-                "message_index": asset.message_index,
-                "part_index": asset.part_index,
-                "kind": asset.kind,
-                "original_filename": asset.filename,
-                "local_path": (
-                    _relative_markdown_path(asset.local_path, output_parent)
-                    if asset.local_path
-                    else None
-                ),
-                "mime_type": asset.mime_type,
-                "size_bytes": asset.size_bytes,
-                "sha256": asset.sha256,
-                "status": "downloaded" if asset.local_path else "unavailable",
-                "error": asset.error,
-            }
-        )
-    manifest_path = directory / "assets.json"
-    manifest_path.write_text(
-        json.dumps({"version": 1, "assets": manifest_assets}, ensure_ascii=False, indent=2)
-        + "\n",
-        encoding="utf-8",
-    )
-    downloaded = len({asset.local_path for asset in assets if asset.local_path})
-    failures = len(assets) - downloaded
-    if strict and failures:
-        raise ExtractionError(
-            "asset download", f"{failures} referenced asset(s) could not be archived"
-        )
-    return downloaded, failures, manifest_path
+    messages = []
+    for message in rich_messages:
+        text = render_rich_message(message)
+        if text:
+            messages.append((message.role, text))
+    return messages
 
 
 def to_markdown(messages, roles: bool = True, bold: bool = False) -> str:
@@ -1382,17 +1012,11 @@ def rich_to_markdown(
     messages,
     roles=True,
     bold=False,
-    output_parent=None,
-    assets_requested=False,
 ):
     rendered = [
         (
             message.role,
-            render_rich_message(
-                message,
-                output_parent=output_parent,
-                assets_requested=assets_requested,
-            ),
+            render_rich_message(message),
         )
         for message in messages
     ]
@@ -1426,38 +1050,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="仅输出不含链接、载荷和正文的结构诊断",
     )
     parser.add_argument(
-        "--download-assets",
-        action="store_true",
-        help="下载公开页面引用的图片、音频和文件",
-    )
-    parser.add_argument(
-        "--assets-dir",
-        help="附件目录；默认在 Markdown 同级创建 assets 文件夹",
-    )
-    parser.add_argument(
-        "--asset-host",
-        action="append",
-        default=[],
-        help="额外允许下载的 HTTPS 资源域名；可重复指定",
-    )
-    parser.add_argument(
-        "--max-asset-mib",
-        type=int,
-        default=DEFAULT_MAX_ASSET_BYTES // (1024 * 1024),
-        help="单个附件大小上限（MiB）",
-    )
-    parser.add_argument(
-        "--max-total-assets-mib",
-        type=int,
-        default=DEFAULT_MAX_TOTAL_ASSET_BYTES // (1024 * 1024),
-        help="全部附件累计下载上限（MiB）",
-    )
-    parser.add_argument(
-        "--strict-assets",
-        action="store_true",
-        help="任一附件无法归档时让导出失败",
-    )
-    parser.add_argument(
         "--include-non-chat-roles",
         action="store_true",
         help="同时导出非用户/助手角色；仍跳过隐藏消息",
@@ -1486,12 +1078,10 @@ def main(argv=None) -> int:
             raise ExtractionError(
                 "output", "--json-summary and --quiet require an output Markdown path"
             )
-        if args.diagnose and (
-            args.output or args.download_assets or args.json_summary or args.quiet
-        ):
+        if args.diagnose and (args.output or args.json_summary or args.quiet):
             raise ExtractionError(
                 "output",
-                "--diagnose cannot be combined with output, asset download, or summary modes",
+                "--diagnose cannot be combined with output or summary modes",
             )
         if "://" in source:
             html = fetch_html(source)
@@ -1509,29 +1099,13 @@ def main(argv=None) -> int:
             html, include_non_chat_roles=args.include_non_chat_roles
         )
         output_path = Path(args.output) if args.output else None
-        if args.download_assets and output_path is None:
-            raise ExtractionError(
-                "output", "--download-assets requires an output Markdown path"
-            )
-        downloaded = 0
-        asset_failures = 0
-        manifest_path = None
-        if args.download_assets:
-            downloaded, asset_failures, manifest_path = download_asset_references(
-                rich_messages,
-                output_path,
-                assets_dir=args.assets_dir,
-                additional_hosts=args.asset_host,
-                max_asset_bytes=args.max_asset_mib * 1024 * 1024,
-                max_total_bytes=args.max_total_assets_mib * 1024 * 1024,
-                strict=args.strict_assets,
-            )
+        attachment_count = sum(
+            len(message.attachments) for message in rich_messages
+        )
         markdown = rich_to_markdown(
             rich_messages,
             roles=not args.no_roles,
             bold=args.bold_roles,
-            output_parent=output_path.resolve().parent if output_path else None,
-            assets_requested=args.download_assets,
         )
         if args.output:
             try:
@@ -1541,9 +1115,7 @@ def main(argv=None) -> int:
             if args.json_summary:
                 _write_json_summary(
                     {
-                        "assets_downloaded": downloaded,
-                        "assets_unavailable": asset_failures,
-                        "manifest": str(manifest_path) if manifest_path else None,
+                        "attachments": attachment_count,
                         "messages": len(rich_messages),
                         "output": str(output_path),
                         "status": "ok",
@@ -1551,12 +1123,10 @@ def main(argv=None) -> int:
                 )
             elif not args.quiet:
                 summary = f"已写入 {args.output}（共 {len(rich_messages)} 条消息"
-                if args.download_assets:
-                    summary += f"，归档 {downloaded} 个附件，{asset_failures} 个不可用"
+                if attachment_count:
+                    summary += f"，标注 {attachment_count} 个附件"
                 summary += "）"
                 print(summary)
-                if manifest_path is not None:
-                    print(f"附件清单：{manifest_path}")
         else:
             sys.stdout.write(markdown)
         return 0
